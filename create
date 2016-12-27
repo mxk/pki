@@ -1,0 +1,71 @@
+#!/bin/sh
+#
+# Written by Maxim Khitrov (December 2016)
+#
+
+test -f /etc/doas.conf -a -x /usr/bin/doas && alias sudo='/usr/bin/doas'
+test "$(id -u)" -eq 0 || exec sudo -- "$0" "$@"
+
+readonly IMG=/var/pki/root-ca/root-ca-2.vnd
+readonly MNT=/var/pki/root-ca/root-ca-2
+readonly SRD=softraid0
+
+_create_() {
+	test ! "$imgstat" || err "$IMG already exists"
+	dd if=/dev/zero of=$IMG bs=1M count=${1:-16} status=none || exit
+	chmod 0600 $IMG
+	cfgvnd
+	fdisk -iyf /dev/zero $vnd || die
+	echo -e 'a\n\n\n\nRAID\nq\n\n' | disklabel -E vnd0 > /dev/null || die
+	bioctl -c C -l ${vnd}a -r ${2:-524288} $SRD || die
+	sd=$(getsd) || die
+	ns=$(disklabel "$sd" | awk -F ': ' '$1=="total sectors" { print $2; exit }')
+	dd if=/dev/zero of=/dev/r${sd}c bs=512 count=$ns status=none || die
+	newfs ${sd}c
+	_close_ $?
+}
+
+_open_() {
+	test ! "$vnd" || err "$IMG is busy"
+	cfgvnd
+	bioctl -c C -l ${vnd}a $SRD || die
+	chflags nouchg $IMG.bak 2> /dev/null
+	cp $IMG $IMG.bak || die
+	chflags uchg $IMG.bak
+	mkdir -p $MNT && mount "/dev/$(getsd)c" $MNT || die
+	chmod 0750 $MNT
+	stat -f 'Last access: %Sa' $MNT
+}
+
+_close_() {
+	if [ -d "$MNT" ]; then
+		umount $MNT
+		rmdir $MNT
+	fi
+	sd=$(getsd) && bioctl -d $sd
+	test ! "$vnd" || vnconfig -u $vnd
+	chflags uchg $IMG
+	test ! "$1" || exit $1
+}
+
+cfgvnd() {
+	vnd=$(vnconfig -l | awk -v rc=1 -F ': ' \
+		'$2=="not in use" { print $1; rc=0; exit } END { exit rc }') || \
+		err 'free vnd device not found'
+	chflags nouchg $IMG
+	vnconfig "$vnd" $IMG || exit
+	trap '_close_ 130' INT
+}
+
+getsd() {
+	bioctl $SRD | awk -v rc=1 \
+		'NR==2 { if ($1=="'"$SRD"'" && $6=="CRYPTO") { print $5; rc=0 } exit }
+		END { exit rc }'
+}
+
+err() { echo error: "$@" 1>&2; exit 1; }
+die() { _close_ $?; }
+
+imgstat=$(stat -qf 'on %Sd, inode %i' $IMG) && \
+	vnd=$(vnconfig -l | awk -F ': ' '/'"$imgstat"'$/ { print $1; exit }')
+_$(basename $0)_

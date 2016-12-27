@@ -1,0 +1,256 @@
+#!/bin/sh
+#
+# Written by Maxim Khitrov (December 2016)
+#
+
+export OPENSSL_CONF=$(readlink -f $(dirname $0)/openssl.conf)
+
+_pkicmd_() {
+	usage <<- END
+		OpenSSL wrapper to simplify PKI and CA management operations.
+
+		The file name used to execute this script (a symbolic or hard link)
+		determines the function that is called. For example, 'ln -s init $0'
+		will create a symlink that calls _init_ when executed.
+
+		Configuration file 'openssl.conf' must be located in the same directory
+		as the symbolic or hard link.
+
+		Directory '.lock' prevents multiple concurrent executions. After an
+		error, this directory is left in place to disable all commands until the
+		user manually restores the relevant CA files to a consistent state.
+
+		The following openssl.conf options are assumed for CA commands:
+
+		new_certs_dir = tmp
+		certificate   = ca/crt.pem
+		private_key   = ca/key.pem
+		database      = ca/index
+		serial        = ca/crt.srl
+		crlnumber     = ca/crl.srl
+	END
+}
+
+_init_() {
+	rootexec "$@" && requirecfg && lock
+	test -e ca -o -e certs -o -e tmp && err 'already initialized'
+	set -o errexit
+
+	local pw
+	pw=$(newpass)
+
+	mkdir -p ca certs
+	mkdir -pm 1770 tmp
+	touch ca/index
+	echo 4D6178696D20592E204B686974726F76 > ca/crt.srl
+	echo 01 > ca/crl.srl
+
+	neweckey secp384r1 ca/key.pem "$pw"
+	echo "$pw" | openssl req -passin stdin -new -key ca/key.pem -out tmp/req.pem
+	openssl req -noout -text -in tmp/req.pem
+	echo "$pw" | openssl ca -passin stdin -batch -selfsign \
+		-startdate $(date -u '+%y%m%d000000Z') -enddate 371231235959Z \
+		-extensions root_ca_ext -notext -in tmp/req.pem -out ca/crt.pem
+	openssl x509 -noout -text -in ca/crt.pem > ca/crt.txt
+
+	rm ca/crt.srl* tmp/*
+	chflags uchg ca/key.pem ca/crt.pem ca/crt.txt
+}
+
+_sign_() {
+	rootexec "$@" && requirecfg && lock
+	local req=$(abspath $1) srl rc
+	test -f "$req" || usage <<- END
+		usage: $0 file [openssl ca options]
+
+		Sign PEM-encoded request in file. The default duration is 5 years. Use
+		-enddate YYMMDDHHMMSSZ to set an explicit end date.
+	END
+	shift
+	while
+		srl=$(rnd159 | tee ca/crt.srl) || exit
+		test -f certs/$srl.pem
+	do :; done
+	openssl ca $(years 5) -notext -in $req "$@" && rm ca/crt.srl* && \
+		mv tmp/$srl.pem certs/ && readlink -f certs/$srl.pem
+}
+
+_newcrl_() {
+	rootexec "$@" && requirecfg && lock
+	local out=$(abspath $1)
+	test $# -ge 1 -a -d "$(dirname $out)" || usage <<- END
+		usage: $0 file [openssl ca options]
+
+		Write new DER-encoded CRL to the specified file.
+	END
+	shift
+	openssl ca -gencrl "$@" | openssl crl -outform DER -out $out && \
+		rm ca/crl.srl.old
+}
+
+_req_() {
+	requirecfg
+	openssl req -new -key key.pem -out req.pem "$@" && \
+		openssl req -noout -text -in req.pem
+}
+
+_req_rsa2048_() {
+	requirecfg
+	local pw
+	set -o errexit
+	test ! -e key.pem || err 'key.pem already exists'
+	pw=$(newpass)
+	echo "$pw" | openssl genpkey -pass stdin -algorithm RSA \
+		-pkeyopt rsa_keygen_bits:2048 -aes-256-cbc -out key.pem
+	echo "$pw" | _req_ -passin stdin
+}
+
+_req_rsa3072_() {
+	requirecfg
+	local pw
+	set -o errexit
+	test ! -e key.pem || err 'key.pem already exists'
+	pw=$(newpass)
+	echo "$pw" | openssl genpkey -pass stdin -algorithm RSA \
+		-pkeyopt rsa_keygen_bits:3072 -aes-256-cbc -out key.pem
+	echo "$pw" | _req_ -passin stdin
+}
+
+_req_p256_() {
+	requirecfg
+	local pw
+	set -o errexit
+	test ! -e key.pem || err 'key.pem already exists'
+	pw=$(newpass)
+	neweckey prime256v1 key.pem "$pw"
+	echo "$pw" | _req_ -passin stdin
+}
+
+_pem2der_crt_() {
+	test -f "$1" || usage <<- END
+		usage: $0 file [openssl x509 options]
+
+		Convert certificate encoding from PEM to DER.
+	END
+	openssl x509 -outform DER -in "$@"
+}
+
+_pem2p12_crt_() {
+	test -f "$1" || usage <<- END
+		usage: $0 file [openssl pkcs12 options]
+
+		Convert certificate encoding from PEM to PKCS#12. Friendly name defaults
+		to the common name of the subject.
+	END
+	local name=$(openssl x509 -noout -subject -in "$1" | \
+		sed -E 's|^.*/CN=([^/]+)|\1|')
+	openssl pkcs12 -export -nokeys -caname "$name" -in "$@"
+}
+
+_view_req_() {
+	test -f "$1" || usage <<- END
+		usage: $0 file [openssl req options]
+
+		Print out a certificate request in text form.
+	END
+	openssl req -noout -text -in "$@"
+}
+
+_view_crt_() {
+	test -f "$1" || usage <<- END
+		usage: $0 file [openssl x509 options]
+
+		Print out a certificate in text form.
+	END
+	openssl x509 -noout -text -fingerprint -in "$@"
+}
+
+_view_key_() {
+	test -f "$1" || usage <<- END
+		usage: $0 file [openssl pkey options]
+
+		Print out a private key in text form.
+
+		FOR TESTING PURPOSES ONLY! DO NOT USE THIS COMMAND ON REAL KEYS!
+	END
+	openssl pkey -noout -text -in "$@"
+}
+
+_view_crl_() {
+	test -f "$1" || usage <<- END
+		usage: $0 file [openssl crl options]
+
+		Print out a certificate revocation list in text form.
+	END
+	openssl crl -noout -text -inform DER -in "$@"
+}
+
+rootexec() {
+	test -f /etc/doas.conf -a -x /usr/bin/doas && alias sudo='/usr/bin/doas'
+	test "$(id -u)" -eq 0 || exec sudo -- "$0" "$@"
+}
+
+abspath() {
+	case "$1" in
+	/*)
+		echo $1;;
+	*)
+		if [ "$locked" ]; then
+			test "$OLDPWD" || err 'unknown previous working directory'
+			echo $OLDPWD/$1
+		else
+			test "$PWD" || err 'unknown current working directory'
+			echo $PWD/$1
+		fi;;
+	esac
+}
+
+getpass() (
+	exec < /dev/tty
+	stty -echo || exit
+	trap 'echo >&2; stty echo' INT TERM EXIT
+	echo -n "${1:-Pass phrase for CA key: }" >&2
+	read pw && echo "$pw"
+)
+
+newpass() {
+	local pw pwc
+	pw=$(getpass 'Pass phrase for new key: (will not echo) ') || return
+	test "${#pw}" -ge 4 || err 'openssl requires at least 4 characters'
+	pwc=$(getpass 'Confirm pass phrase for new key: ') || return
+	test "X$pw" = "X$pwc" || err 'pass phrase mismatch'
+	echo "$pw"
+}
+
+neweckey() {
+	local curve=$1 out=$2 pw="$3"
+	# As of OpenBSD 6.0, EC private keys cannot be generated with genpkey
+	# because -pkeyopt ec_param_enc:named_curve is not supported. The generated
+	# key uses explicit parameters, which results in an unusable certificate.
+	{
+		echo "$pw"
+		openssl ecparam -genkey -noout -name $curve -param_enc named_curve
+	} | openssl pkey -passout stdin -aes-256-cbc -out $out && chmod 0400 $out
+}
+
+rnd159() {
+	# https://tools.ietf.org/html/rfc5280#section-4.1.2.2
+	printf '%02X%.38s\n' $((RANDOM & 0x7f)) \
+		$(dd if=/dev/random bs=32 count=1 status=none | sha256 -q \
+		| tr '[:lower:]' '[:upper:]')
+}
+
+years() {
+	local n=$1 y=$(date -u '+%y') md=$(date -u '+%m%d')
+	printf -- '-startdate %s%s000000Z -enddate %02d%s235959Z' $y $md \
+		$(((y + n) % 100)) $md
+}
+
+err()        { echo error: "$@" 1>&2; exit 1; }
+usage()      { cat >&2; unlock; exit 2; }
+requirecfg() { test -f $OPENSSL_CONF || err "$OPENSSL_CONF not found"; }
+lock()       { cd $(dirname $0) && mkdir .lock || err 'lock failed'; locked=1; }
+unlock()     { test ! "$locked" || rmdir .lock 2> /dev/null; }
+
+umask 0027
+_$(basename $0 | sed s/-/_/g)_ "$@" && unlock
